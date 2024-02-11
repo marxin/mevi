@@ -1,7 +1,7 @@
 use std::{os::fd::AsRawFd, sync::mpsc};
 
 use humansize::{make_format, BINARY};
-use mevi_common::{MemState, MeviEvent, TraceeId, TraceePayload};
+use mevi_common::{MemMapping, MeviEvent, TraceeId, TraceePayload};
 use nix::unistd::{sysconf, SysconfVar};
 use tracing::{debug, warn};
 use userfaultfd::Uffd;
@@ -60,9 +60,9 @@ pub(crate) fn handle(tx: &mut mpsc::SyncSender<MeviEvent>, tid: TraceeId, uffd: 
                     }
                 }
                 let addr = addr as u64;
-                send_ev(TraceePayload::MemStateChange {
+                send_ev(TraceePayload::MemMappingChange {
                     range: addr..addr + page_size,
-                    state: MemState::Resident,
+                    mapping: MemMapping::Resident,
                 });
             }
             userfaultfd::Event::Remap { from, to, len } => {

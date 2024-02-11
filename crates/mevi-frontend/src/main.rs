@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use gloo_net::websocket::{futures::WebSocket, Message};
 use humansize::{make_format, BINARY};
 use itertools::Itertools;
-use mevi_common::{MemMap, MemState, MeviEvent, TraceeId, TraceePayload};
+use mevi_common::{MemMap, MemMapping, MemState, MeviEvent, TraceeId, TraceePayload};
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
@@ -23,16 +23,7 @@ struct TraceeState {
 
 impl TraceeState {
     fn total_rss(&self) -> u64 {
-        self.map
-            .iter()
-            .map(|(range, state)| {
-                if state == &MemState::Resident {
-                    range.end - range.start
-                } else {
-                    0
-                }
-            })
-            .sum()
+        self.map.iter().map(|(range, state)| state.rss(range)).sum()
     }
 }
 
@@ -169,10 +160,7 @@ fn app() -> Html {
     let mut total_res: u64 = 0;
     for (range, mem_state) in tracees.values().flat_map(|v| v.map.iter()) {
         total_virt += range.end - range.start;
-
-        if *mem_state == MemState::Resident {
-            total_res += range.end - range.start;
-        }
+        total_res += mem_state.rss(range);
     }
 
     let formatter = make_format(BINARY);
@@ -210,10 +198,7 @@ fn app() -> Html {
                                         let mut res: u64 = 0;
                                         for (range, mem_state) in tracee.map.iter() {
                                                 virt += range.end - range.start;
-
-                                            if *mem_state == MemState::Resident {
-                                                res += range.end - range.start;
-                                            }
+                                                res += mem_state.rss(range);
                                         }
                                         html! {
                                             <>
@@ -232,7 +217,7 @@ fn app() -> Html {
                                 </div>
                                 {{
                                     let map = &tracee.map;
-                                    let has_any_memory_resident = map.iter().any(|(_, state)| *state == MemState::Resident);
+                                    let has_any_memory_resident = map.iter().any(|(_, state)| state.mapping == MemMapping::Resident);
                                     if !has_any_memory_resident {
                                         return html!{ };
                                     }
@@ -274,7 +259,7 @@ fn app() -> Html {
                                     for group in groups {
                                         let mut group_markup = vec![];
 
-                                        let has_any_memory_resident = group.ranges.iter().any(|(_, state)| *state == MemState::Resident);
+                                        let has_any_memory_resident = group.ranges.iter().any(|(_, state)| state.mapping == MemMapping::Resident);
                                         if !has_any_memory_resident && !options.show_nonresident_groups {
                                             continue;
                                         }
@@ -311,17 +296,24 @@ fn app() -> Html {
 
                                             // avoid some allocations
                                             let state_class = |ms: MemState| -> &'static str {
-                                                match ms {
-                                                    MemState::Resident => "r",
-                                                    MemState::NotResident => "n",
-                                                    MemState::Untracked => "u",
+                                                match ms.mapping {
+                                                    MemMapping::Resident => "r",
+                                                    MemMapping::NotResident => "n",
+                                                    MemMapping::Untracked => "u",
                                                 }
                                             };
 
                                             let style = format!("width:{}%;left:{}%;", size as f64 * scale_ratio, (range.start - group.start) as f64 * scale_ratio);
+                                            let mut flags = String::new();
+                                            if mem_state.flags.read {
+                                                flags.push('R');
+                                            }
+                                            if mem_state.flags.write {
+                                                flags.push('W');
+                                            }
                                             let h = if size >= min_size_for_print {
                                                 html! {
-                                                    <i class={state_class(mem_state)} title={format!("{} at {:x?}", formatter(size), range)} style={style}>{
+                                                    <i class={state_class(mem_state)} title={format!("{} at {:x?} {flags}", formatter(size), range)} style={style}>{
                                                         formatter(size).to_string()
                                                     }</i>
                                                 }

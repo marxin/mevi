@@ -9,7 +9,7 @@ use axum::{
 };
 use color_eyre::Result;
 use humansize::{make_format, BINARY};
-use mevi_common::{MemMap, MemState, MeviEvent, TraceeId, TraceePayload, TraceeSnapshot};
+use mevi_common::{MemMap, MeviEvent, TraceeId, TraceePayload, TraceeSnapshot};
 use postage::{broadcast, sink::Sink, stream::Stream};
 use tokio::time::Instant;
 use tracer::Tracer;
@@ -112,9 +112,7 @@ fn relay(ev_rx: mpsc::Receiver<MeviEvent>, mut payload_tx: broadcast::Sender<Mev
                     for (range, state) in tracee.map.iter() {
                         let size = range.end - range.start;
                         total_vsz += size;
-                        if let MemState::Resident = state {
-                            total_rss += size;
-                        }
+                        total_rss += state.rss(range);
                     }
                     let formatter = make_format(BINARY);
                     tracing::warn!(

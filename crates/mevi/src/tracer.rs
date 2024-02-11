@@ -14,7 +14,7 @@ use std::{
 use color_eyre::Result;
 use humansize::{make_format, BINARY};
 use libc::{sockaddr_un, user_regs_struct};
-use mevi_common::{MemState, MeviEvent, TraceeId, TraceePayload};
+use mevi_common::{MemMapping, MemProtFlags, MemState, MeviEvent, TraceeId, TraceePayload};
 use nix::{
     errno::Errno,
     sys::{
@@ -49,6 +49,10 @@ enum MemoryChange {
     },
     PageOut {
         range: Range<u64>,
+    },
+    MProtect {
+        range: Range<u64>,
+        flags: MemProtFlags,
     },
 }
 
@@ -206,7 +210,10 @@ impl Tracer {
                                                 tracing::warn!(
                                                     "failed to register {range:?} with uffd: {e:?}"
                                                 );
-                                                state = MemState::Untracked;
+                                                state = MemState {
+                                                    mapping: MemMapping::Untracked,
+                                                    ..state
+                                                }
                                             }
                                         }
                                         TraceeKind::Thread { pid } => {
@@ -249,10 +256,17 @@ impl Tracer {
                                 MemoryChange::PageOut { range } => {
                                     let ev = MeviEvent::TraceeEvent(
                                         for_tid,
-                                        TraceePayload::MemStateChange {
+                                        TraceePayload::MemMappingChange {
                                             range,
-                                            state: MemState::NotResident,
+                                            mapping: MemMapping::NotResident,
                                         },
+                                    );
+                                    self.tx.send(ev).unwrap();
+                                }
+                                MemoryChange::MProtect { range, flags } => {
+                                    let ev = MeviEvent::TraceeEvent(
+                                        for_tid,
+                                        TraceePayload::MemFlagsChange { range, flags },
                                     );
                                     self.tx.send(ev).unwrap();
                                 }
@@ -470,14 +484,21 @@ impl Tracee {
                     if let Some(end) = ret.checked_add(len) {
                         let range = start..end;
                         debug!("{} thread of {for_tid} just did mmap {range:x?} addr_in={addr_in:x?} len={len:x?} prot=({prot_flags:?}) flags=({map_flags:?}) fd={fd} ret={ret:x?}", self.tid);
+                        let mapping = if map_flags.contains(MapFlags::MAP_POPULATE) {
+                            MemMapping::Resident
+                        } else {
+                            MemMapping::NotResident
+                        };
                         return Ok(Some(MemoryEvent {
                             for_tid,
                             change: MemoryChange::Map {
                                 range,
-                                state: if map_flags.contains(MapFlags::MAP_POPULATE) {
-                                    MemState::Resident
-                                } else {
-                                    MemState::NotResident
+                                state: MemState {
+                                    mapping,
+                                    flags: MemProtFlags {
+                                        read: prot_flags.contains(ProtFlags::PROT_READ),
+                                        write: prot_flags.contains(ProtFlags::PROT_WRITE),
+                                    },
                                 },
                             },
                         }));
@@ -575,12 +596,15 @@ impl Tracee {
 
                         if heap_range.end > old_top {
                             // heap just grew
-                            debug!("heap grew from {old_top:x?} to {:x?}", heap_range.end);
+                            info!("heap grew from {old_top:x?} to {:x?}", heap_range.end);
                             return Ok(Some(MemoryEvent {
                                 for_tid,
                                 change: MemoryChange::Map {
                                     range: old_top..heap_range.end,
-                                    state: MemState::Resident,
+                                    state: MemState {
+                                        mapping: MemMapping::NotResident,
+                                        flags: MemProtFlags::default(),
+                                    },
                                 },
                             }));
                         }
@@ -598,6 +622,25 @@ impl Tracee {
                 } else {
                     warn!("a thread is changing the brk for the process, we should handle that");
                 }
+            }
+            libc::SYS_mprotect => {
+                let addr = regs.rdi;
+                let len = regs.rsi;
+                let prot = regs.rdx as i32;
+                let prot_flags = ProtFlags::from_bits(prot as _).unwrap();
+
+                info!("mprotect with {addr:x} len: {len} flags: {prot_flags:?}");
+
+                return Ok(Some(MemoryEvent {
+                    for_tid,
+                    change: MemoryChange::MProtect {
+                        range: addr..addr + len,
+                        flags: MemProtFlags {
+                            read: prot_flags.contains(ProtFlags::PROT_READ),
+                            write: prot_flags.contains(ProtFlags::PROT_WRITE),
+                        },
+                    },
+                }));
             }
             _ => {
                 // let's ignore those
@@ -983,9 +1026,9 @@ impl Tracee {
 
             tx.send(MeviEvent::TraceeEvent(
                 tid,
-                TraceePayload::MemStateChange {
+                TraceePayload::MemMappingChange {
                     range: range.clone(),
-                    state: MemState::Untracked,
+                    mapping: MemMapping::Untracked,
                 },
             ))
             .unwrap();
@@ -1034,10 +1077,16 @@ impl Tracee {
                         tid,
                         TraceePayload::MemStateChange {
                             range: addr..addr + page_size,
-                            state: if mp.contains(MemoryPageFlags::PRESENT) {
-                                MemState::Resident
-                            } else {
-                                MemState::NotResident
+                            state: MemState {
+                                mapping: if mp.contains(MemoryPageFlags::PRESENT) {
+                                    MemMapping::Resident
+                                } else {
+                                    MemMapping::NotResident
+                                },
+                                flags: MemProtFlags {
+                                    read: map.perms.contains(MMPermissions::READ),
+                                    write: map.perms.contains(MMPermissions::WRITE),
+                                },
                             },
                         },
                     ))

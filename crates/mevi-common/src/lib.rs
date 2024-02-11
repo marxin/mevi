@@ -6,10 +6,40 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub enum MemState {
+pub enum MemMapping {
     Resident,
     NotResident,
     Untracked,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct MemProtFlags {
+    pub read: bool,
+    pub write: bool,
+}
+
+impl Default for MemProtFlags {
+    fn default() -> Self {
+        Self {
+            read: true,
+            write: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct MemState {
+    pub mapping: MemMapping,
+    pub flags: MemProtFlags,
+}
+
+impl MemState {
+    pub fn rss(&self, range: &Range<u64>) -> u64 {
+        match self.mapping {
+            MemMapping::Resident => range.end - range.start,
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -70,6 +100,16 @@ pub enum TraceePayload {
         state: MemState,
     },
 
+    MemMappingChange {
+        range: Range<u64>,
+        mapping: MemMapping,
+    },
+
+    MemFlagsChange {
+        range: Range<u64>,
+        flags: MemProtFlags,
+    },
+
     // Clears a specific mapping
     Unmap {
         range: Range<u64>,
@@ -94,6 +134,37 @@ pub enum ConnectSource {
 }
 
 impl TraceePayload {
+    fn modify_range_state(
+        &self,
+        map: &mut MemMap,
+        range: &Range<u64>,
+        f: impl Fn(&MemState) -> MemState,
+    ) {
+        // build the modified state as a separate map
+        let mut modified_state = MemMap::default();
+
+        for (subrange, substate) in map.overlapping(range) {
+            let mut subrange = subrange.clone();
+
+            if subrange.start < range.start {
+                subrange.start = range.start;
+            }
+            if subrange.end > range.end {
+                subrange.end = range.end;
+            }
+
+            modified_state.insert(subrange.clone(), f(substate));
+        }
+
+        // remove current state for the given interval
+        map.remove(range.clone());
+
+        // and merge in the new state
+        for (subrange, state) in modified_state.into_iter() {
+            map.insert(subrange, state);
+        }
+    }
+
     pub fn apply_to_memmap(&self, map: &mut MemMap) {
         match self {
             TraceePayload::Exec => {
@@ -102,6 +173,18 @@ impl TraceePayload {
             }
             TraceePayload::MemStateChange { range, state } => {
                 map.insert(range.clone(), *state);
+            }
+            TraceePayload::MemMappingChange { range, mapping } => {
+                self.modify_range_state(map, range, |state| MemState {
+                    mapping: mapping.clone(),
+                    flags: state.flags.clone(),
+                });
+            }
+            TraceePayload::MemFlagsChange { range, flags } => {
+                self.modify_range_state(map, range, |state| MemState {
+                    mapping: state.mapping.clone(),
+                    flags: flags.clone(),
+                });
             }
             TraceePayload::Unmap { range } => {
                 if range.start >= range.end {
@@ -136,13 +219,26 @@ impl TraceePayload {
                             formatter((new_range.end - old_range.end) as _),
                             new_range
                         );
-                        map.insert(new_pages, MemState::NotResident);
+                        // FIXME
+                        map.insert(
+                            new_pages,
+                            MemState {
+                                mapping: MemMapping::NotResident,
+                                flags: MemProtFlags::default(),
+                            },
+                        );
                     }
                 } else {
                     // the new range is elsewhere - we need to copy the state
                     let mut merge_state = MemMap::default();
                     // by default everything is non-resident
-                    merge_state.insert(new_range.clone(), MemState::NotResident);
+                    merge_state.insert(
+                        new_range.clone(),
+                        MemState {
+                            mapping: MemMapping::NotResident,
+                            flags: MemProtFlags::default(),
+                        },
+                    );
 
                     // now copy over old state
                     for (old_subrange, old_state) in map.overlapping(old_range) {
